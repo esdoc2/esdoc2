@@ -28,7 +28,11 @@ export default class ESDoc {
    */
   static generate(config) {
     return new Promise((resolve) => {
-      assert(config.source);
+      assert(config.root || config.source);
+      if (config.root) {
+        assert(!config.source);
+        assert(!config.package);
+      }
       assert(config.destination);
 
       this._checkOldConfig(config);
@@ -99,8 +103,9 @@ export default class ESDoc {
       stringifyWriteTransform.on('finish', onWriteFinish);
       stringifyWriteTransform.on('error', fatalError);
 
-      this._walk(config.source, (filePath) => {
+      const walkCallback = (filePath) => {
         const relativeFilePath = path.relative(sourceDirPath, filePath);
+
         let match = false;
         for (const reg of includes) {
           if (relativeFilePath.match(reg)) {
@@ -119,7 +124,21 @@ export default class ESDoc {
         if (!temp) return;
         results.push(...temp.results);
         stringifyWriteTransform.write({filePath: `source${path.sep}${relativeFilePath}`, ast: temp.ast});
-      });
+      };
+
+      const walkRootCallback = (filePath, fileContents = null) => {
+        if (path.basename(filePath) === 'package.json') {
+          results.push(this._generateForPackageJSON(filePath, fileContents));
+        } else {
+          walkCallback(filePath);
+        }
+      };
+
+      if (config.root) {
+        this._walkRoot(config.root, walkRootCallback);
+      } else {
+        this._walk(config.source, walkCallback);
+      }
 
       stringifyWriteTransform.end();
 
@@ -128,9 +147,8 @@ export default class ESDoc {
         results.push(this._generateForIndex(config));
       }
 
-      // config.package
       if (config.package) {
-        results.push(this._generateForPackageJSON(config));
+        results.push(this._generateForOldPackageJSON(config));
       }
 
       results = this._resolveDuplication(results);
@@ -192,7 +210,61 @@ export default class ESDoc {
 
     if (!config.index) config.index = './README.md';
 
-    if (!config.package) config.package = './package.json';
+    if (config.source && !config.package) config.package = './package.json';
+  }
+
+
+  static _walkRoot(dirPath, callback) {
+    const entries = fs.readdirSync(dirPath);
+
+    const hasPackageJson = entries.includes('package.json');
+
+    if (hasPackageJson) {
+      const packagePath = path.resolve(dirPath, 'package.json');
+      let packageObj;
+      try {
+        packageObj = require(packagePath);
+        console.log('Found package at', packagePath);
+      } catch (e) {
+        console.error('Failed to parse package at', packagePath);
+      }
+      if (packageObj) {
+        const srcDir = path.resolve(
+          dirPath,
+          (packageObj.directories && packageObj.directories.src) || 'src'
+        );
+        // When we encounter a package root, skip to its source dir.
+        // Thus we avoid trying to document node_modules and config files.
+        let srcDirStat;
+        try {
+          srcDirStat = fs.statSync(srcDir);
+        } catch (e) {
+          // handled below
+        }
+        let error = false;
+        if (!srcDirStat) {
+          error = true;
+          console.error(`Looked for project sources in ${srcDir}, but the directory did not exist.`);
+        } else if (!srcDirStat.isDirectory()) {
+          error = true;
+          console.error(`Tried to find project sources in ${srcDir}, which is not a directory.`);
+        }
+        if (error) {
+          console.error(`You are seeing this because you attempted to document a folder which contains a package.json file.`);
+          console.error(`If you need to override a package's source directory, set "directories": { "src": "mySrcDir" } in package.json.`);
+        }
+
+        callback(packagePath, packageObj);
+
+        this._walkRoot(srcDir, callback);
+        return;
+      } else {
+        console.error(`Found unparseable package.json at ${packagePath}. Aborting.`);
+        return;
+      }
+    }
+
+    this._walk(dirPath, callback, this._walkRoot);
   }
 
   /**
@@ -201,7 +273,7 @@ export default class ESDoc {
    * @param {function(entryPath: string)} callback - callback for find file.
    * @private
    */
-  static _walk(dirPath, callback) {
+  static _walk(dirPath, callback, recurse = this._walk) {
     const entries = fs.readdirSync(dirPath);
 
     for (const entry of entries) {
@@ -211,7 +283,7 @@ export default class ESDoc {
       if (stat.isFile()) {
         callback(entryPath);
       } else if (stat.isDirectory()) {
-        this._walk(entryPath, callback);
+        recurse(entryPath, callback, recurse);
       }
     }
   }
@@ -278,7 +350,18 @@ export default class ESDoc {
    * @returns {Tag}
    * @private
    */
-  static _generateForPackageJSON(config) {
+  static _generateForPackageJSON(packagePath, packageObj) {
+    return {
+      kind: 'package',
+      package: packageObj,
+      longname: packagePath,
+      name: path.basename(packagePath),
+      static: true,
+      access: 'public'
+    };
+  }
+
+  static _generateForOldPackageJSON(config) {
     let packageJSON = '';
     let packagePath = '';
     try {
@@ -288,16 +371,10 @@ export default class ESDoc {
       // ignore
     }
 
-    const tag = {
+    return Object.assign(this._generateForPackageJSON(packagePath, null), {
       kind: 'packageJSON',
       content: packageJSON,
-      longname: packagePath,
-      name: path.basename(packagePath),
-      static: true,
-      access: 'public'
-    };
-
-    return tag;
+    });
   }
 
   /**
